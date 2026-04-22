@@ -16,9 +16,6 @@ This project is intended as a reference implementation for Automation Engineer, 
 - Defensive automation  
   The pipeline aborts safely on validation failures, duplicate detection, or reconciliation mismatches.
 
-- Controlled promotion  
-  Live data is populated exclusively from validated staging data.
-
 - Operational transparency  
   Structured logging and explicit error propagation make failures easy to diagnose.
 
@@ -35,7 +32,7 @@ Data cleansing
 ↓  
 Fiscal context resolution  
 ↓  
-Duplicate detection (staging)  
+Duplicate detection (live)  
 ↓  
 Load to staging  
 ↓  
@@ -79,6 +76,7 @@ All identifiers, schemas, and endpoints are anonymised for public reference.
 
 .
 ├── etl_pipeline.py
+├── SMTP_helper.py
 ├── README.md
 └── logs/
 
@@ -88,16 +86,6 @@ All sensitive values such as credentials, URLs, and filesystem paths are supplie
 
 No secrets or proprietary identifiers are included in this repository.
 
-## Intended Audience
-
-This project is aimed at:
-
-- Automation Engineers  
-- DevOps Engineers  
-- Platform Engineers  
-- Site Reliability Engineers  
-
-It focuses on automation patterns, guardrails, and operational thinking rather than domain-specific business logic.
 
 ## Disclaimer
 
