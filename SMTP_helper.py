@@ -3,12 +3,16 @@ import smtplib
 from email.message import EmailMessage
 from datetime import datetime
 
-SMTP_HOST = ""
-SMTP_PORT = 25
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = os.getenv("SMTP_PORT")
 
 
-from_address = ""
-to_address = ""
+from_address = os.getenv("FROM_ADDRESS")
+to_address = os.getenv("TO_ADDRESS")
 
 
 
