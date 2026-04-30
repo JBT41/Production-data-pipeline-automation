@@ -501,12 +501,18 @@ def main():
 
         #--Load the data from staging to live, send success email
         load_staging_to_live(STAGING_TABLE,LIVE_TABLE,sdyr,sdwk)
-        send(success=True,
-             sdyr=sdyr,
-             sdwk=sdwk,
-             rows_loaded = expected_rows_uploaded
+        try:
+            send(success=True,
+                 sdyr=sdyr,
+                 sdwk=sdwk,
+                 rows_loaded = expected rows_uploaded
+                )
+        except Exception as success_error:
+            logging.exception("Failed to send Success Email", exc_info=success_err)
 
-             )
+except Exception as mail_err:
+    logging.exception("Success email failed", exc_info=mail_err)
+
 
     # Exceptions move up and get caught here, notify via SMTP script failed.
     except Exception as err:
