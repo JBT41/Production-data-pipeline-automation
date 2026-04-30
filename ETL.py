@@ -11,7 +11,7 @@ import requests
 import os
 from datetime import datetime
 import pandas as pd
-from SMTP_PLACEHOLDER import send   # <-- redacted placeholder
+from SMTP_helper import send   
 
 #-----------------#
 # logging configs #
