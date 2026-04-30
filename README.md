@@ -4,9 +4,12 @@
 
 This repository demonstrates a production-style automated data pipeline built with Python, designed around safety, observability, and controlled data promotion.
 
+This pipeline was developed by myself as an Application Support Analyst for Barratt Redrow to automate a manual data ingestion task.
+this is a project that is used in a prod environment. 
+
 The pipeline follows a staging-first approach commonly used in enterprise and regulated environments, where incoming data is fully validated before being promoted to a live table. The design prioritises reliability, recoverability, and clarity of failure over raw throughput.
 
-This project is intended as a reference implementation for Automation Engineer, DevOps Engineer, and Platform Engineer roles.
+
 
 ## Key Design Principles
 
