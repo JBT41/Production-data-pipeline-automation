@@ -1,69 +1,79 @@
 #-----------------#
 #    Packages     #
 #-----------------#
-
-import jaydebeapi
 import jpype
 import logging
 import csv
 import urllib3
 import requests
 import os
+import keyring
 from datetime import datetime
 import pandas as pd
-from SMTP_helper import send   
+from SMTP_Helper import send
+from pathlib import Path
+from dotenv import load_dotenv
 
-#-----------------#
-# logging configs #
-#-----------------#
+load_dotenv()
+BASE_DIR = Path(__file__).resolve().parents[1]
+today = datetime.today().strftime("%Y-%m-%d")
+
+LOG_DIR = BASE_DIR / os.environ["LOG_DIR"]
+OUTPUT_DIR = BASE_DIR / os.environ["OUTPUT_DIR"]
+RAW_DIR = BASE_DIR / os.environ["RAW_DIR"]
+jt400_path = BASE_DIR / os.environ["JT400_JAR"]
+LOG_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+system = os.environ["SYSTEM"]
+driver = "com.ibm.as400.access.AS400JDBCDriver"
+url = f"jdbc:as400://{system};translate binary=true"
+cred = keyring.get_credential("AS400", None)
+
+if not cred:
+    raise RuntimeError("Missing AS400 credentials")
+
+user = cred.username
+password = cred.password
+
+if not jpype.isJVMStarted():
+    jpype.startJVM(
+        classpath=[str(jt400_path)]
+    )
+
+import jaydebeapi
+
 logging.basicConfig(
-    filename=r"C:\path\to\logs\loader.log",   # REDACTED
+    filename=LOG_DIR / "loader.log",
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-#---------------------#
-# Environment configs #
-#---------------------#
-
-output_folder = r"C:\path\to\output"          # REDACTED
-today = datetime.today().strftime("%Y-%m-%d")
-jt400_path = r"C:\path\to\drivers\jt400.jar"  # REDACTED
-
-system = "<DB_SYSTEM_HOST>"
-user = "<DB_USERNAME>"
-password = "<DB_PASSWORD>"
-
-url = f"jdbc:as400://{system};translate binary=true"
-driver = "com.ibm.as400.access.AS400JDBCDriver"
-
-STAGING_TABLE = "<SCHEMA>.STAGING_TABLE"
-LIVE_TABLE    = "<SCHEMA>.LIVE_TABLE"
-
-data_url = "https://example.com/source.csv"   # REDACTED
+data_url = "https://docs.google.com/spreadsheets/d/11diXmQ4fqPklkpOmaHA-UzLGgBITlKfhVZ2WjzUpkeA/gviz/tq?tqx=out:csv&gid=0"
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+STAGING_TABLE = "JAKET.MDWV"
+LIVE_TABLE    = "JAKET.MDWV_LIVE"
 
 def download_web_visits():
-    os.makedirs(output_folder, exist_ok=True)
 
-    output_file = os.path.join(output_folder, f"web_lead_data_{today}.csv")
+    output_file = RAW_DIR / f"web_Lead_data_{today}.csv"
     resp = requests.get(data_url, verify=False)
     resp.raise_for_status()
 
     lines = resp.text.split("\n")
 
-    if len(lines) >= 2:
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(resp.text)
-        return output_file
-    else:
-        raise ValueError("Data Missing from source, Download aborted")
+    if len(lines) < 2:
+        raise ValueError("Data missing from source, download aborted")
+
+    output_file.write_text(resp.text, encoding="utf-8")
+    return output_file
 
 
 def clean_data(output_file):
     cleaned_data = []
-    with open(output_file, "r", encoding="utf-8") as f:
+    with output_file.open("r", encoding="utf-8") as f:
         reader = csv.reader(f)
         next(reader, None)
         for row in reader:
@@ -71,291 +81,451 @@ def clean_data(output_file):
                 continue
             if row[1] is None or row[1].strip().lower() in ["<null>", "null", ""]:
                 continue
-            cleaned_data.append(row)
-    return cleaned_data
-
+            else:
+                cleaned_data.append(row)
+        return cleaned_data
 
 def save_cleaned_data(cleaned_data, output_file):
     with open(output_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(cleaned_data)
 
-
 def fiscal():
+    """
+    Fetch fiscal year/week info from the database
+
+    Returns:
+        tuple: (sdyr, sdwk) from the database if found
+    """
+
     conn = None
     cur = None
 
     try:
-        logging.info("Fiscal year/week retrieval initiated")
-        conn = jaydebeapi.connect(driver, url, [user, password], jt400_path)
-        cur = conn.cursor()
+        logging.info(f"Fiscal year/week retrieval initiated")
+        try:
+            logging.info(f"Connecting to database")
+            conn = jaydebeapi.connect(driver, url, [user, password])
+            cur = conn.cursor()
+            logging.info(f"Connection established.")
+        except Exception as conn_err:
+            logging.error(f"Connection failed: {conn_err}")
+            logging.exception(f"Stacktrace")
+            raise
 
-        sql = """
-            SELECT
-                COL_YEAR,
-                COL_PERIOD
-            FROM <SCHEMA>.FISCAL_CALENDAR
-            WHERE DATE_KEY = INTEGER(TO_CHAR(CURRENT DATE, 'YYYYMMDD'))
-        """
-        cur.execute(sql)
-        row = cur.fetchone()
+        try:
+            logging.info(f"Executing SQL query... Fetching Fiscal period...")
+            sql = """
+                select
+                SDYR,
+                SDWK
+                FROM cdlivdta.bcal
+                where sddte = INTEGER(TO_CHAR(CURRENT DATE, 'YYYYMMDD'))
+            """
+            cur.execute(sql)
+            row = cur.fetchone()
+            logging.info(f"SQL executed successfully, fiscal info retrieved")
+            logging.info(f"Fiscal week loaded - SDYR: {row[0]}, SDWK: {row[1]}")
+        except Exception as sql_err:
+            logging.error(f"SQL execution failed: {sql_err}")
+            logging.exception("Stacktrace")
+            raise
 
         if not row:
-            raise ValueError(f"No fiscal year/week found for {today}")
+            msg = f"No fiscal year/week found for {today}"
+            logging.error(msg)
+            raise ValueError(msg)
+        sdyr = row[0]
+        sdwk = row[1]
 
-        return row[0], row[1]
-
+        return sdyr, sdwk
+    #--- Finally block designed to run no matter what
     finally:
         if cur is not None:
             try:
+                logging.info(f"Attempting to Close cursor")
                 cur.close()
-            except Exception:
-                logging.exception("Failed to close cursor")
+                logging.info(f"Cursor closed successfully")
+            except Exception as cur_close_error:
+                logging.error(f"Failed to close cursor: {cur_close_error}")
+                logging.exception(f"Stacktrace:")
+                pass
 
         if conn is not None:
             try:
+                logging.info(f"Attempting to Close connection to database")
                 conn.close()
-            except Exception:
-                logging.exception("Failed to close connection")
+                logging.info(f"Connection closed")
+            except Exception as conn_close_error:
+                logging.error(f"Failed to close connection: {conn_close_error}")
+                logging.exception("Stacktrace:")
+                pass
+
+def fetch_existing_records(table,sdyr,sdwk):
+    """
+    Fetch live records from the database for the current fiscal year/week
+
+    :param sdyr:
+    :param sdwk:
 
 
-def fetch_existing_records(table, sdyr, sdwk):
-    logging.info("Duplicate record check initiated")
+    """
+    logging.info(f"Duplicate record check initiated")
     conn = None
     cur = None
+    try:
+        logging.info(f"Attempting to connect to the database")
+        conn = jaydebeapi.connect(driver, url, [user, password])
+        cur = conn.cursor()
+        logging.info(f"Connection established.")
+    except Exception as conn_err:
+        logging.error(f"Connection failed: {conn_err}")
+        logging.exception(f"Stacktrace")
+        raise
 
     try:
-        conn = jaydebeapi.connect(driver, url, [user, password], jt400_path)
-        cur = conn.cursor()
-
+        logging.info(f"Executing SQL query... Fetching live records...")
         sql = f"""
-            SELECT *
+            SELECT 
+            REGCDE,
+            SMSITE,
+            SDYR,
+            SDWK,
+            MDWVYW,
+            MDWVHT,
+            MDWVWV,
+            CRTDA2,
+            CRTTIM,
+            CRTUSR,
+            CRTFNC,
+            UPDDA2,
+            UPDTIM,
+            UPDUSR,
+            UPDFNC,
+            UPDATE_IDENT
             FROM {table}
-            WHERE COL_YEAR = ?
-              AND COL_PERIOD = ?
+            WHERE SDYR = ?
+            and SDWK = ?
         """
-        cur.execute(sql, (sdyr, sdwk))
-        return cur.fetchall()
+        cur.execute(sql,(sdyr,sdwk))
+        rows = cur.fetchall()
+        return(rows)
+
+
+    except Exception as SQL_ERR:
+        logging.error(f"SQL execution failed: {SQL_ERR}")
+        raise
 
     finally:
         if cur is not None:
             try:
+                logging.info(f"Attempting to close Cursor")
                 cur.close()
-            except Exception:
-                logging.exception("Failed to close cursor")
-
+                logging.info(f"Cursor closed")
+            except Exception as cur_close_error:
+                logging.error(f"Failed to close cursor: {cur_close_error}")
+                logging.exception(f"Stacktrace:")
+                pass
         if conn is not None:
             try:
+                logging.info(f"Attempting to close connection to the database")
                 conn.close()
-            except Exception:
-                logging.exception("Failed to close connection")
+                logging.info(f"Connection closed")
+            except Exception as conn_close_error:
+                logging.error(f"Failed to close connection: {conn_close_error}")
+                logging.exception("Stacktrace:")
+                pass
 
-
-def load(table, sdyr, sdwk, cleaned_file):
-    logging.info("Data load initiated")
+def load(table,sdyr,sdwk,cleaned_file):
+    logging.info(f"Data load initiated")
     conn = None
     cur = None
+
     rows = 0
     inserted = 0
 
     now = datetime.now()
     crtda2 = int(now.strftime("%Y%m%d"))
     crttim = int(now.strftime("%H%M%S"))
+    crtusr = "PYLOAD"
+    crtfnc = "LOAD"
 
     sql = f"""
-        INSERT INTO {table} (
-            COL_KEY_1,
-            COL_KEY_2,
-            COL_YEAR,
-            COL_PERIOD,
-            METRIC_A,
-            METRIC_B,
-            METRIC_C,
-            CREATED_DATE,
-            CREATED_TIME,
-            CREATED_BY,
-            CREATED_FUNCTION,
-            UPDATED_DATE,
-            UPDATED_TIME,
-            UPDATED_BY,
-            UPDATED_FUNCTION,
-            BATCH_ID
-        ) VALUES (
+        insert INTO {table} (
+            REGCDE, SMSITE, SDYR, SDWK,
+            MDWVYW, MDWVHT, MDWVWV, CRTDA2,
+            CRTTIM, CRTUSR, CRTFNC, UPDDA2,
+            UPDTIM, UPDUSR, UPDFNC, UPDATE_IDENT 
+
+            ) VALUES (
             ?, ?, ?, ?,
             0, 0, ?, ?,
-            ?, 'ETLJOB', 'LOAD',
-            0, 0, '', '', 1
-        )
-    """
+            ?, ?, ?, 0,
+            0, '', '', 1 
+            )
+            """
+    try:
+        logging.info(f"Connecting to database")
+        conn = jaydebeapi.connect(driver, url, [user, password])
+        cur = conn.cursor()
+        logging.info(f"Connection established")
+    except Exception as conn_err:
+        logging.error(f"Connection failed: {conn_err}")
+        raise
 
     try:
-        conn = jaydebeapi.connect(driver, url, [user, password], jt400_path)
-        cur = conn.cursor()
-
+        logging.info(f"Loading dat...")
         with open(cleaned_file, newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
             for row in reader:
+
+                #--- Check if there are any blank lines in the CSV
+                #-- if there are, abort the load.
                 if not row:
-                    raise Exception("Blank line detected in CSV")
+                    logging.error("Blank line detected in CSV. Data invalid. Load aborted.")
+                    raise Exception("Blank line detected in CSV. Data invalid. Load aborted.")
 
                 rows += 1
+                regcde = row[0]
+                smsite = row[1]
+                mdwvwv = row[2]
+
                 params = [
-                    row[0],
-                    row[1],
-                    sdyr,
-                    sdwk,
-                    int(row[2]),
-                    crtda2,
-                    crttim
-                ]
-                cur.execute(sql, params)
-                inserted += 1
+                    regcde,  # REGCDE
+                    smsite,  # SMSITE
+                    int(sdyr),  # SDYR from fiscal()
+                    int(sdwk),  # SDWK from fiscal()
+                    int(mdwvwv),  # MDWVWV from CSV
+                    crtda2,  # CRTDA2
+                    crttim,  # CRTTIM
+                    crtusr,  # CRTUSR
+                    crtfnc  # CRTFNC
+                    ]
+                try:
+                    cur.execute(sql, params)
+                    inserted += 1
+                except Exception as sql_err:
+                    logging.error(f"Row failed: {row}, error {sql_err}")
+                    raise Exception(f"Row failed:{row}, error {sql_err}")
 
-        if inserted != rows:
-            raise Exception("INSERT COUNT MISMATCH")
+                #--- check if the number of rows loaded into the database is = to the number of rows in the CSV file
+                #-- if not, then abort. otherwise commit the insert to the database
+            if inserted != rows:
+                logging.error(f"INSERT COUNT MISMATCH: Inserted {inserted} rows out of {rows} CSV lines. LOAD ABORTED")
+                raise Exception (f"INSERT COUNT MISMATCH: Inserted {inserted} rows out of {rows} CSV lines. LOAD ABORTED")
+            conn.commit()
+            logging.info(f"Inserted {inserted} rows out of {rows} ")
 
-        conn.commit()
-        logging.info(f"Inserted {inserted} rows out of {rows}")
-
+    except Exception as sql_err:
+        logging.error(f"SQL execution failed: {sql_err}")
+        raise
     finally:
         if cur is not None:
             try:
+                logging.info(f"Attempting to Close cursor")
                 cur.close()
-            except Exception:
-                logging.exception("Failed to close cursor")
-
-        if conn is not None:
+                logging.info(f"Cursor closed")
+            except Exception as cur_close_error:
+                logging.error(f"Failed to close cursor: {cur_close_error}")
+                logging.exception("Stacktrace:")
+                pass
             try:
+                logging.info(f"Attempting to close connection to database")
                 conn.close()
-            except Exception:
-                logging.exception("Failed to close connection")
+                logging.info(f"Connection closed")
+            except Exception as conn_close_error:
+                logging.error(f"Failed to close connection: {conn_close_error}")
+                logging.exception("Stacktrace:")
+                pass
 
-
-def transform_staging_to_df(table, sdyr, sdwk):
-    conn = jaydebeapi.connect(driver, url, [user, password], jt400_path)
+def transform_staging_to_df(table,sdyr,sdwk):
+    """
+      Fetch staging records for a fiscal period and return a normalised DataFrame
+      """
+    conn = jaydebeapi.connect(driver, url, [user, password])
     cur = conn.cursor()
 
+
     sql = f"""
-        SELECT
-            COL_KEY_1,
-            COL_KEY_2,
-            COL_YEAR,
-            COL_PERIOD,
-            METRIC_A,
-            METRIC_B,
-            METRIC_C
-        FROM {table}
-        WHERE COL_YEAR = ?
-          AND COL_PERIOD = ?
-    """
-    cur.execute(sql, (sdyr, sdwk))
+
+                    SELECT 
+                    REGCDE,
+                    SMSITE,
+                    SDYR,
+                    SDWK,
+                    MDWVYW,
+                    MDWVHT,
+                    MDWVWV
+                    FROM {table}
+                    WHERE SDYR = ?
+                    and SDWK = ?
+                """
+    cur.execute(sql,(sdyr,sdwk))
     rows = cur.fetchall()
 
     cur.close()
     conn.close()
 
+
+
     cols = [
-        "COL_KEY_1",
-        "COL_KEY_2",
-        "COL_YEAR",
-        "COL_PERIOD",
-        "METRIC_A",
-        "METRIC_B",
-        "METRIC_C"
+        "REGCDE",
+        "SMSITE",
+        "SDYR",
+        "SDWK",
+        "MDWVYW",
+        "MDWVHT",
+        "MDWVWV"
     ]
 
     df = pd.DataFrame(rows, columns=cols)
-    df["COL_KEY_2"] = df["COL_KEY_2"].astype(str).str.strip()
 
-    int_cols = ["COL_KEY_1", "COL_YEAR", "COL_PERIOD", "METRIC_A", "METRIC_B", "METRIC_C"]
+    # Normalise CHAR columns (Db2 CHAR padding)
+    df["SMSITE"] = df["SMSITE"].astype(str).str.strip()
+
+    # Enforce numeric columns to match DB schema
+    int_cols = ["REGCDE", "SDYR", "SDWK", "MDWVYW", "MDWVHT", "MDWVWV"]
     df[int_cols] = df[int_cols].astype(int)
 
-    return df.sort_values(["COL_KEY_1", "COL_KEY_2"]).reset_index(drop=True)
-
+    return df.sort_values(["REGCDE", "SMSITE"]).reset_index(drop=True)
 
 def transform_csv_to_df(cleaned_file, sdyr, sdwk):
-    df = pd.read_csv(cleaned_file, header=None, names=["COL_KEY_1", "COL_KEY_2", "METRIC_C"])
-    df["COL_YEAR"] = int(sdyr)
-    df["COL_PERIOD"] = int(sdwk)
-    df["METRIC_A"] = 0
-    df["METRIC_B"] = 0
 
+    df = pd.read_csv(
+        cleaned_file,
+        header=None,
+        names=["REGCDE", "SMSITE", "MDWVWV"]
+    )
+
+    # Inject DB context columns
+    df["SDYR"] = int(sdyr)
+    df["SDWK"] = int(sdwk)
+    df["MDWVYW"] = 0
+    df["MDWVHT"] = 0
+
+    # Reorder to match DB SELECT
     df = df[
-        ["COL_KEY_1", "COL_KEY_2", "COL_YEAR", "COL_PERIOD", "METRIC_A", "METRIC_B", "METRIC_C"]
+        ["REGCDE", "SMSITE", "SDYR", "SDWK", "MDWVYW", "MDWVHT", "MDWVWV"]
     ]
 
-    df["COL_KEY_2"] = df["COL_KEY_2"].astype(str).str.strip()
-    df[["COL_KEY_1", "COL_YEAR", "COL_PERIOD", "METRIC_A", "METRIC_B", "METRIC_C"]] = \
-        df[["COL_KEY_1", "COL_YEAR", "COL_PERIOD", "METRIC_A", "METRIC_B", "METRIC_C"]].astype(int)
+    # Only strip CHAR columns
+    df["SMSITE"] = df["SMSITE"].astype(str).str.strip()
 
-    return df.sort_values(["COL_KEY_1", "COL_KEY_2"]).reset_index(drop=True)
+    # Enforce numeric columns explicitly
+    int_cols = ["REGCDE", "SDYR", "SDWK", "MDWVYW", "MDWVHT", "MDWVWV"]
+    df[int_cols] = df[int_cols].astype(int)
 
+    return df.sort_values(["REGCDE", "SMSITE"]).reset_index(drop=True)
 
-def load_staging_to_live(staging_table, live_table, sdyr, sdwk):
+def load_staging_to_live(staging_table,live_table,sdyr,sdwk):
+    """
+        Promote validated data from staging table to live table
+        for a specific fiscal year/week.
+        """
+
     sql = f"""
-        INSERT INTO {live_table}
-        SELECT *
-        FROM {staging_table}
-        WHERE COL_YEAR = ?
-          AND COL_PERIOD = ?
+    insert into {live_table}
+    select * from {staging_table}
+    where sdyr = ?
+    and sdwk = ?
     """
 
     conn = None
     cur = None
     try:
-        conn = jaydebeapi.connect(driver, url, [user, password], jt400_path)
+        logging.info(f"Moving data from {staging_table} to {live_table} for {sdyr}, {sdwk}")
+        conn = jaydebeapi.connect(driver,url,[user,password])
         cur = conn.cursor()
-        cur.execute(sql, (sdyr, sdwk))
-        conn.commit()
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
 
+        cur.execute(sql,(int(sdyr),int(sdwk)))
+        conn.commit()
+
+        rows_inserted = cur.rowcount
+
+        if rows_inserted == 0:
+            raise RuntimeError(
+                f"No rows inserted into {live_table} for {sdyr} and {sdwk}"
+            )
+
+    except Exception as sql_err:
+        logging.error(f"Failed to promote Staging to Live: {sql_err}")
+        raise
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception as cur_close_error:
+                logging.error(f"Failed to close cursor: {cur_close_error}")
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as conn_close_error:
+                logging.error(f"Failed to close connection: {conn_close_error}")
+                pass
 
 def main():
     sdyr = None
     sdwk = None
     expected_rows_uploaded = None
-
+    start_time = datetime.now()
     try:
         logging.info("Starting ETL job")
 
+        #--Download Data from google sheets, save, clean data , save --------#
         output_file = download_web_visits()
         cleaned_rows = clean_data(output_file)
         expected_rows_uploaded = len(cleaned_rows)
-
-        cleaned_file = output_file.replace(".csv", "_cleaned.csv")
+        cleaned_file = OUTPUT_DIR / output_file.name.replace(".csv", "_cleaned.csv")
         save_cleaned_data(cleaned_rows, cleaned_file)
 
+        #-- Call Fiscal to fetch fiscal week from current date
         sdyr, sdwk = fiscal()
 
-        validate_rows = fetch_existing_records(STAGING_TABLE, sdyr, sdwk)
+        #---AVOID DUPLICATES - Fetch existing records from Live, if returned cancel job
+        validate_rows = fetch_existing_records(STAGING_TABLE,sdyr,sdwk)
         if validate_rows:
-            raise ValueError(
-                f"Duplicate records found for year={sdyr}, period={sdwk}"
+            msg = (
+                f"Duplicate MDWV records found for SDYR:{sdyr}, SDWK:{sdwk}. LOAD ABORTED!"
             )
+            raise ValueError(msg)
 
-        load(STAGING_TABLE, sdyr, sdwk, cleaned_file)
-
-        staging_df = transform_staging_to_df(STAGING_TABLE, sdyr, sdwk)
+        #-- Load CSV into stg, re-query staging, convert stg, csv to df
+        load(STAGING_TABLE,sdyr,sdwk,cleaned_file)
+        staging_df = transform_staging_to_df(STAGING_TABLE,sdyr,sdwk)
         csv_df = transform_csv_to_df(cleaned_file, sdyr, sdwk)
 
+        #--Compare staging df and csv df, if they do not match cancel job
         if not staging_df.equals(csv_df):
             raise ValueError("Staging data does not match source CSV")
 
-        load_staging_to_live(STAGING_TABLE, LIVE_TABLE, sdyr, sdwk)
+        #--Load the data from staging to live, send success email
+        load_staging_to_live(STAGING_TABLE,LIVE_TABLE,sdyr,sdwk)
+        send(success=True,
+             sdyr=sdyr,
+             sdwk=sdwk,
+             rows_loaded = expected_rows_uploaded
 
-        send(success=True, sdyr=sdyr, sdwk=sdwk, rows_loaded=expected_rows_uploaded)
+             )
 
+    # Exceptions move up and get caught here, notify via SMTP script failed.
     except Exception as err:
         try:
-            send(success=False, error=err, sdyr=sdyr, sdwk=sdwk)
-        except Exception:
-            logging.exception("Failed to send failure notification")
+            # Send failure email notification
+            send(
+                success=False,
+                error=err,
+                sdyr = sdyr,
+                sdwk = sdwk
+            )
+        # Ensure if the email send fails the exception is not confused with ETL failure
+        except Exception as mail_err:
+            logging.exception("failed to send mail", exc_info=mail_err)
         raise
 
+    finally:
+        if jpype.isJVMStarted():
+            jpype.shutdownJVM()
 
 if __name__ == "__main__":
     main()
